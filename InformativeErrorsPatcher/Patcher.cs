@@ -1,10 +1,12 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using BepInEx;
+﻿using BepInEx;
+using BepInEx.Logging;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 using MonoMod.Utils;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 
 namespace InformativeErrorsPatcher
 {
@@ -12,72 +14,76 @@ namespace InformativeErrorsPatcher
     {
         public static IEnumerable<string> TargetDLLs { get; } = ["Assembly-CSharp.dll"];
 
-        public static void Patch(AssemblyDefinition assembly)
+        public static ManualLogSource Log = Logger.CreateLogSource("Informative Errors Patcher");
+
+        public static bool TryLoadPluginModule(out ModuleDefinition mod)
         {
-            var log = BepInEx.Logging.Logger.CreateLogSource("InformativeErrors");
+            var patcherDllPath = typeof(Patcher).Assembly.Location;
+            var patchersPath = Path.GetDirectoryName(patcherDllPath);
+            var wmitfRootPath = Path.GetDirectoryName(patchersPath);
+            var pluginsPath = Path.Combine(wmitfRootPath, "plugins");
+            var pluginDllPath = Path.Combine(pluginsPath, "InformativeErrors.dll");
 
-            var module = assembly.MainModule;
-            var typeDef = module.GetType("EffectInfo");
-            var str = module.ImportReference(typeof(string));
-
-            var method = new MethodDefinition("ToString", MethodAttributes.Public, str);
-            var body = method.Body;
-            var il = body.GetILProcessor();
-
-            var effect = typeDef.FindField("effect");
-            var entry = typeDef.FindField("entryVariable");
-            var target = typeDef.FindField("targets");
-
-            var effectSOType = effect.FieldType.Resolve();
-            var objectType = effectSOType.BaseType.Resolve().BaseType.Resolve();
-            var objectName = module.ImportReference(objectType.FindMethod("get_name"));
-            var objectEq = module.ImportReference(objectType.FindMethod("op_Equality"));
-
-            var concat = module.ImportReference(typeof(string).GetMethod("Concat", [typeof(string), typeof(string)]));
-
-            var objType = module.ImportReference(typeof(object));
-            var getType = module.ImportReference(objType.Resolve().Methods.First(x => x.Is(typeof(object).GetMethod("GetType"))));
-
-            var typeName = module.ImportReference(typeof(Type).GetMethod("get_Name"));
-
-            Instruction eqInstr;
-            Instruction retInstr;
-
-            il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Ldfld, effect);
-            il.Emit(OpCodes.Callvirt, getType);
-            il.Emit(OpCodes.Callvirt, typeName);
-            
-            il.Emit(OpCodes.Ldstr, ", ");
-            il.Emit(OpCodes.Call, concat);
-            
-            il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Ldfld, entry);
-            il.Emit(OpCodes.Call, module.ImportReference(typeof(Patcher).GetMethod("IntToString")));
-            il.Emit(OpCodes.Call, concat);
-
-            il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Ldfld, target);
-            il.Emit(OpCodes.Ldnull);
-            il.Append(eqInstr = il.Create(OpCodes.Call, objectEq));
-
-            il.Emit(OpCodes.Ldstr, ", ");
-            il.Emit(OpCodes.Call, concat);
-
-            il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Ldfld, target);
-            il.Emit(OpCodes.Callvirt, objectName);
-            il.Emit(OpCodes.Call, concat);
-
-            il.Append(retInstr = il.Create(OpCodes.Ret));
-            il.InsertAfter(eqInstr, il.Create(OpCodes.Brtrue, retInstr));
-
-            typeDef.Methods.Add(method);
+            try
+            {
+                mod = ModuleDefinition.ReadModule(pluginDllPath);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                mod = null;
+                Log.LogError($"Failed to read plugin dll: {ex}");
+                return false;
+            }
         }
 
-        public static string IntToString(int v)
+        public static void Patch(AssemblyDefinition assembly)
         {
-            return v.ToString();
+            if (!TryLoadPluginModule(out var pluginModule))
+                return;
+
+            var module = assembly.MainModule;
+            var str = module.ImportReference(typeof(string));
+
+            var basegameToStringExtensions = pluginModule.GetType("InformativeErrors.BasegameToStringExtensions");
+            var classesToAddToStringTo = new Dictionary<string, string>()
+            {
+                ["EffectInfo"] = "EffectInfoToString"
+            };
+
+            foreach(var kvp in classesToAddToStringTo)
+            {
+                var type = module.GetType(kvp.Key);
+
+                if(type == null)
+                {
+                    Log.LogError($"No type with the name {kvp.Key} exists.");
+                    continue;
+                }
+
+                if(type.FindMethod("ToString") != null)
+                {
+                    Log.LogError($"{type.FullName} already has a ToString method.");
+                    continue;
+                }
+
+                var toStringExtMethod = basegameToStringExtensions.FindMethod(kvp.Value);
+                if(toStringExtMethod == null)
+                {
+                    Log.LogError($"{basegameToStringExtensions.Name} doesn't have a method with the name {kvp.Value}");
+                    continue;
+                }
+
+                var method = new MethodDefinition("ToString", MethodAttributes.Public, str);
+                var body = method.Body;
+                var il = body.GetILProcessor();
+
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Call, toStringExtMethod);
+                il.Emit(OpCodes.Ret);
+
+                type.Methods.Add(method);
+            }
         }
     }
 }
